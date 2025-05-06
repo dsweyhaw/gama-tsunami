@@ -1,5 +1,20 @@
 model tsunami
 
+// Define the grid first, before global
+grid cell_grid width: 100 height: 100 neighbors: 8 {
+    bool is_land <- false;
+    bool is_road <- false;
+    bool is_flooded <- false;
+    int shelter_id <- -1;
+    float distance_to_safezone <- float(100000.0);
+    rgb color <- ocean_color;
+    float flood_intensity <- 0.0;
+    
+    aspect default {
+        draw shape color: is_flooded ? rgb(0, 0, 255, flood_intensity) : color border: #black;
+    }
+}
+
 global {
     // GIS and data files
     file building_shapefile <- file("../includes/buildings.shp");
@@ -9,12 +24,12 @@ global {
     // Image files for species
     file car_icon <- file("../includes/car-2897.png");
     file boat_icon <- file("../includes/ship-1051.png");
-
+    
     // Environment parameters
     geometry shape <- envelope(building_shapefile);
     geometry land_area;
     geometry valid_area;
-
+    
     // Lists for shelter management
     list<point> shelter_locations;
     list<float> shelter_capacities;
@@ -32,13 +47,13 @@ global {
     // Population counts and sizes
     int locals_number <- 100;
     float locals_size <- 4.0;
-
+    
     int tourists_number <- 50;
     float tourists_size <- 4.0;
-
+    
     int rescuers_number <- 20;
     float rescuers_size <- 4.0;
-
+    
     // Status counts for each population
     int locals_safe <- 0;
     int locals_dead <- 0;
@@ -60,17 +75,17 @@ global {
     int tsunami_approach_time <- 460; // seconds
     geometry tsunami_front;
     float coastal_x_coord;
-
+    
     // Tsunami visualization parameters
     float wave_width <- 50.0; // Width of the visible wave effect
     geometry tsunami_shape;
     list<geometry> flood_areas;
-
+    
     // Color parameters
     rgb land_color <- rgb(204, 175, 139);  // Light brown for land
     rgb ocean_color <- rgb(135, 206, 235);  // Light blue for ocean
     rgb road_color <- rgb(71, 71, 71);      // Dark grey for roads
-
+    
     // Car parameters
     float car_speed_min <- 1.4;  // m/s
     float car_speed_max <- 36.1; // m/s
@@ -78,7 +93,7 @@ global {
     float car_deceleration <- 5.0;
     int cars_threshold_wait <- 5;
     string car_strategy <- "always go ahead" among: ["always go ahead", "go out when congestion"];  // Removed unused strategy
-
+    
     // Car counters
     int cars_safe <- 0;
     int cars_dead <- 0;
@@ -87,19 +102,19 @@ global {
     rgb cars_safe_color <- #green;
     rgb cars_dead_color <- #red;
     rgb cars_in_danger_color <- #brown;
-
+    
     // Boat parameters
     float boat_speed_min <- 2.0;  // m/s
     float boat_speed_max <- 10.0; // m/s
     float boat_rescue_radius <- 20.0;
     int boat_capacity <- 20;
     int boats_number <- 5;
-
+    
     // Boat counters
     int boats_safe <- 0;
     int boats_dead <- 0;
     int boats_in_danger <- 0;
-
+    
     // Car initialization
     action init_cars {
         create car number: cars_number {
@@ -107,7 +122,7 @@ global {
             cars_in_danger <- cars_in_danger + 1;
         }
     }
-
+    
     // Boat initialization
     action init_boats {
         create boat number: boats_number {
@@ -117,7 +132,7 @@ global {
             boats_in_danger <- boats_in_danger + 1;
         }
     }
-
+    
     init {
         // Create physical environment first
         create building from: building_shapefile {
@@ -128,7 +143,7 @@ global {
         // Define land area (union of buildings and roads)
         land_area <- union(building collect each.shape, road collect each.shape);
         valid_area <- land_area;
-
+        
         // Initialize water/land areas
         loop c over: cell_grid {
             if (c.shape intersects land_area) {
@@ -139,17 +154,17 @@ global {
                 c.is_land <- false;
             }
         }
-
+        
         // Draw roads on top
         ask road {
             color <- road_color;
         }
-
+        
         // Draw buildings on top
         ask building {
             color <- rgb(120, 120, 120);  // Grey for buildings
         }
-
+        
         // Initialize shelter system from CSV using exact coordinates
         matrix data <- matrix(shelter_csvfile);
         loop i from: 0 to: data.rows - 1 {
@@ -197,26 +212,26 @@ global {
             nb_tourists_to_rescue <- 0;
             location <- any_location_in(one_of(road));
         }
-
+        
         // Initialize tsunami parameters
         coastal_x_coord <- max(building collect each.location.x);
         tsunami_front <- square(1) at_location {max(world.shape.width * 1.2, coastal_x_coord + 500), world.shape.height/2};
         tsunami_shape <- rectangle(wave_width, world.shape.height) at_location {max(world.shape.width * 1.2, coastal_x_coord + 500), world.shape.height/2};
         flood_areas <- [];
-
+        
         // Initialize cars
         do init_cars();
-
+        
         // Initialize boats
         do init_boats();
     }
-
+    
     reflex update_tsunami when: cycle >= tsunami_approach_time {
         // Update tsunami position
         float tsunami_movement <- tsunami_speed * step;
         tsunami_front <- tsunami_front translated_by {-tsunami_movement, 0};
         tsunami_shape <- tsunami_shape translated_by {-tsunami_movement, 0};
-
+        
         // Update flooding visualization
         ask cell_grid overlapping tsunami_shape {
             if !is_flooded {
@@ -224,12 +239,12 @@ global {
                 flood_intensity <- 0.3;
             }
         }
-
+        
         // Increase flood intensity for previously flooded cells
         ask cell_grid where (each.is_flooded) {
             flood_intensity <- min([1.0, flood_intensity + 0.01]);
         }
-
+        
         // Update road flooding using proper GAMA spatial operators
         ask road where (each.shape intersects tsunami_shape) {
             is_flooded <- true;
@@ -282,7 +297,7 @@ species people skills: [moving] {
     bool is_valid_location(point new_loc) {
         return (valid_area covers new_loc) and (shape intersects land_area);
     }
-
+    
     // Death checking reflex - runs every step
     reflex check_death when: !is_dead and !is_safe {
         // Check if current location is flooded using proper GAMA spatial operators
@@ -352,7 +367,6 @@ species people skills: [moving] {
                 }
             }
             match "tourist" {
-                // Tourists follow their strategy (wandering/following/crowd)
                 if (tourist_strategy = "wandering") {
                     point possible_loc <- self.location + {rnd(-1,1) * speed, rnd(-1,1) * speed};
                     if (is_valid_location(possible_loc)) {
@@ -382,7 +396,6 @@ species people skills: [moving] {
                 }
             }
             match "rescuer" {
-                // Rescuers look for tourists then head to shelter
                 list<people> nearby_tourists <- (people where (each.type = "tourist" and !each.is_safe)) at_distance radius_look;
                 if (!empty(nearby_tourists)) {
                     point target <- (shelter closest_to self).location;
@@ -413,11 +426,11 @@ species car skills: [moving] {
     float speed <- rnd(car_speed_min, car_speed_max);
     int nb_people_in <- 1 + rnd(3);  // 1-4 people in car
     float cars_time_wait <- 0.0;
-
+    
     aspect default {
         draw car_icon size: {150,100} rotate: heading at: location;  // Much larger size
     }
-
+    
     reflex check_safety when: !is_dead and !is_safe {
         shelter nearest_shelter <- shuffle(shelter) first_with (each distance_to self < 10.0);
         if (nearest_shelter != nil) {
@@ -431,7 +444,7 @@ species car skills: [moving] {
             }
         }
     }
-
+    
     reflex move when: !is_dead and !is_safe {
         // Strategy 1: Always go ahead
         if (car_strategy = "always go ahead") {
@@ -441,7 +454,7 @@ species car skills: [moving] {
                 // Check for car ahead
                 list<car> nearby_cars <- car at_distance 10.0;
                 car car_ahead <- !empty(nearby_cars) ? nearby_cars first_with (each.location = location + {cos(heading), sin(heading)} * 10.0) : nil;
-
+                
                 if (car_ahead != nil) {
                     // Slow down
                     speed <- speed - car_deceleration;
@@ -492,7 +505,7 @@ species boat skills: [moving] {
     bool is_safe <- false;
     rgb color <- #blue;
     float speed <- rnd(boat_speed_min, boat_speed_max);
-
+    
     aspect default {
         draw boat_icon size: {200,150} rotate: heading at: location;
     }
@@ -513,16 +526,20 @@ experiment tsunami_simulation type: gui {
             species cell_grid aspect: default transparency: 0.3;
             species building aspect: default transparency: 0.7;
             species road aspect: default;
+            
+            // Draw vehicles and people
+            species car aspect: default transparency: 0.0;  // No transparency for vehicles
+            species boat aspect: default transparency: 0.0;
             species people aspect: default;
             species shelter aspect: default;
-
+            
             // Draw tsunami on top
             graphics "tsunami" {
                 if cycle >= tsunami_approach_time {
                     draw tsunami_shape color: rgb(0,0,255,0.5) border: rgb(0,0,255,0.8);
                 }
             }
-
+            
             graphics "Legend" {
                 float x <- world.shape.width * 0.8;
                 float y <- world.shape.height * 0.95;
