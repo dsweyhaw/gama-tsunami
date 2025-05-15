@@ -300,7 +300,25 @@ species people skills: [moving] {
     float agent_size;
     
     bool is_valid_location(point new_loc) {
-        return (valid_area covers new_loc) and (shape intersects land_area);
+        // First check if the location is within valid area bounds
+        if (!(valid_area covers new_loc)) {
+            return false;
+        }
+        
+        // Check if the location is on land using cell_grid
+        cell_grid test_cell <- cell_grid closest_to new_loc;
+        if (test_cell = nil or !test_cell.is_land) {
+            return false;
+        }
+        
+        // Check if the location is on or very close to a road
+        bool near_road <- false;
+        list<road> nearby_roads <- road at_distance 2.0;  // Small distance to ensure we're on/near road
+        if (!empty(nearby_roads)) {
+            near_road <- true;
+        }
+        
+        return near_road;
     }
     
     // Death checking reflex - runs every step
@@ -370,19 +388,116 @@ species people skills: [moving] {
                 if (speed < human_speed_min) { speed <- human_speed_min; }
                 if (speed > human_speed_max) { speed <- human_speed_max; }
                 
-                point target <- (shelter closest_to self).location;
+                shelter target_shelter <- shelter closest_to self;
+                point target <- target_shelter.location;
                 path path_to_target <- topology(road) path_between (self.location, target);
+                
+                // Try direct path first
                 if (path_to_target != nil) {
-                    do follow path: path_to_target speed: speed;
+                    point next_pos <- first(path_to_target.vertices);
+                    cell_grid next_cell <- cell_grid closest_to next_pos;
+                    
+                    // If next position is valid, follow the path
+                    if (next_cell != nil and next_cell.is_land) {
+                        do follow path: path_to_target speed: speed;
+                    } else {
+                        // Next position is invalid (water), try alternate directions
+                        list<int> indices <- [0, 1, 2, 3, 4, 5, 6, 7];
+                        loop times: 8 {
+                            int idx <- rnd(length(indices) - 1);
+                            float angle <- (indices[idx] * 45.0);
+                            remove idx from: indices;
+                            
+                            // Try to find a valid position in this direction
+                            point test_pos <- location + {cos(angle) * speed * 2, sin(angle) * speed * 2};
+                            cell_grid test_cell <- cell_grid closest_to test_pos;
+                            
+                            if (test_cell != nil and test_cell.is_land) {
+                                // Found valid position, now try to find path from there
+                                path new_path <- topology(road) path_between (test_pos, target);
+                                if (new_path != nil) {
+                                    // Move to the test position
+                                    location <- test_pos;
+                                    // Try to follow the new path
+                                    do follow path: new_path speed: speed;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // If we haven't moved (no valid direction found), try moving along current road
+                        if (location = self.location) {
+                            road current_road <- road closest_to self;
+                            if (current_road != nil) {
+                                list<point> road_points <- current_road.shape.points;
+                                point best_point <- nil;
+                                float min_dist <- self distance_to target_shelter;
+                                
+                                // Find point on road closest to shelter
+                                loop pt over: road_points {
+                                    cell_grid pt_cell <- cell_grid closest_to pt;
+                                    if (pt_cell != nil and pt_cell.is_land) {
+                                        float dist <- pt distance_to target_shelter;
+                                        if (dist < min_dist) {
+                                            min_dist <- dist;
+                                            best_point <- pt;
+                                        }
+                                    }
+                                }
+                                
+                                if (best_point != nil) {
+                                    path road_path <- topology(road) path_between (self.location, best_point);
+                                    if (road_path != nil) {
+                                        do follow path: road_path speed: speed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // No path to target, try moving towards shelter while staying on land
+                    list<road> nearby_roads <- road at_distance 30.0;
+                    if (!empty(nearby_roads)) {
+                        // Sort roads by distance to shelter to prefer better options
+                        road best_road <- nearby_roads with_min_of (each distance_to target_shelter);
+                        if (best_road != nil) {
+                            point safe_loc <- any_location_in(best_road);
+                            cell_grid safe_cell <- cell_grid closest_to safe_loc;
+                            if (safe_cell != nil and safe_cell.is_land) {
+                                path safe_path <- topology(road) path_between (self.location, safe_loc);
+                                if (safe_path != nil) {
+                                    do follow path: safe_path speed: speed;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             match "tourist" {
                 if (tourist_strategy = "wandering") {
-                    // Increased random movement range to make it more visible (from -5 to 5)
-                    point possible_loc <- self.location + {rnd(-5,5) * speed, rnd(-5,5) * speed};
-                    if (is_valid_location(possible_loc)) {
+                    // Try to find a valid location in 8 different directions
+                    point possible_loc <- nil;
+                    list<float> angles <- [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0];
+                    
+                    // First try random movement
+                    possible_loc <- self.location + {rnd(-5,5) * speed, rnd(-5,5) * speed};
+                    
+                    // If random location is not valid, try systematic directions
+                    if (!is_valid_location(possible_loc)) {
+                        loop angle over: angles {
+                            point test_loc <- self.location + {cos(angle) * speed * 3, sin(angle) * speed * 3};
+                            if (is_valid_location(test_loc)) {
+                                possible_loc <- test_loc;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Move if we found a valid location
+                    if (possible_loc != nil and is_valid_location(possible_loc)) {
                         location <- possible_loc;
                     }
+                    // If no valid location found, stay in place (which is better than moving to invalid location)
                 } else if (tourist_strategy = "following rescuers or locals") {
                     if (leader = nil) {
                         list<people> potential_leaders <- (people where (each.type = "rescuer")) at_distance radius_look;
@@ -434,6 +549,26 @@ species people skills: [moving] {
                         if (is_valid_location(target)) {
                             location <- target;
                         }
+                    } else {
+                        // Fallback: try to find and follow rescuers or locals
+                        list<people> potential_leaders <- (people where (each.type = "rescuer")) at_distance radius_look;
+                        if (empty(potential_leaders)) {
+                            potential_leaders <- (people where (each.type = "local")) at_distance radius_look;
+                        }
+                        if (!empty(potential_leaders)) {
+                            // Follow the closest leader
+                            people closest_leader <- potential_leaders with_min_of (each distance_to self);
+                            path path_to_leader <- topology(road) path_between (self.location, closest_leader.location);
+                            if (path_to_leader != nil) {
+                                do follow path: path_to_leader speed: speed;
+                            }
+                        } else {
+                            // No crowd or leaders found, fall back to random wandering
+                            point possible_loc <- self.location + {rnd(-1,1) * speed, rnd(-1,1) * speed};
+                            if (is_valid_location(possible_loc)) {
+                                location <- possible_loc;
+                            }
+                        }
                     }
                 }
             }
@@ -459,7 +594,7 @@ species people skills: [moving] {
     aspect default {
         draw circle(agent_size * 5) color: is_dead ? #red : (is_safe ? #green : color) border: #black;
     }
-}
+} 
 
 // Car species definition
 species car skills: [moving] {
@@ -600,15 +735,31 @@ experiment tsunami_simulation type: gui {
             }
         }
         
-        monitor "Safe locals" value: locals_safe;
-        monitor "Dead locals" value: locals_dead;
-        monitor "Safe tourists" value: tourists_safe;
-        monitor "Dead tourists" value: tourists_dead;
-        monitor "Safe rescuers" value: rescuers_safe;
-        monitor "Dead rescuers" value: rescuers_dead;
-        monitor "Safe cars" value: cars_safe;
-        monitor "Dead cars" value: cars_dead;
-        monitor "Safe boats" value: boats_safe;
-        monitor "Dead boats" value: boats_dead;
+        // Add separate charts for safe and dead agents
+        display "Safe Agents Chart" {
+            chart "Safe Agents Status" type: series {
+                // Safe agents data
+                data "Safe Locals" value: locals_safe color: rgb(255, 191, 0);
+                data "Safe Tourists" value: tourists_safe color: #violet;
+                data "Safe Rescuers" value: rescuers_safe color: #blue;
+            }
+        }
+        
+        display "Dead Agents Chart" {
+            chart "Dead Agents Status" type: series {
+                // Dead agents data
+                data "Dead Locals" value: locals_dead color: rgb(255, 191, 0);
+                data "Dead Tourists" value: tourists_dead color: #violet;
+                data "Dead Rescuers" value: rescuers_dead color: #blue;
+            }
+        }
+        
+        // Keep the overall pie chart
+        display "Overall Safety Status" {
+            chart "Overall Safety vs Casualties" type: pie {
+                data "Total Safe" value: locals_safe + tourists_safe + rescuers_safe color: #green;
+                data "Total Casualties" value: locals_dead + tourists_dead + rescuers_dead color: #red;
+            }
+        }
     }
 }
