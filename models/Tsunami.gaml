@@ -40,9 +40,9 @@ global {
     int people_patch_threshold <- 10;  // max number of people per patch
     
     // Speed parameters (in m/s)
-    float human_speed_avg <- 1.4;  
-    float human_speed_min <- 0.8;
-    float human_speed_max <- 3.0;
+    float human_speed_avg <- 5.6;  // 20 km/h average human speed
+    float human_speed_min <- 5.6;  // Minimum speed
+    float human_speed_max <- 10.0; // 36 km/h maximum speed (running)
     
     // Population counts and sizes
     int locals_number <- 100;
@@ -68,11 +68,16 @@ global {
     int rescuers_in_danger <- 0;
     
     // Tourist strategy parameter
-    string tourist_strategy <- "wandering" among: ["wandering", "following rescuers or locals", "following crowd"];
+    string tourist_strategy <- "following rescuers or locals" among: ["wandering", "following rescuers or locals", "following crowd"];
+    
+    // Following crowd parameters
+    float crowd_search_angle <- 45.0;  // Angle increment for crowd searching (degrees)
+    float crowd_centroid_distance <- 7.5;  // Half of radius_look
+    float crowd_centroid_radius <- 7.5;   // Half of radius_look
     
     // Tsunami parameters
-    float tsunami_speed <- 44.3;  // m/s
-    int tsunami_approach_time <- 460; // seconds
+    float tsunami_speed <- 44.3;  // m/s (sqrt(200*9.8) for shallow water)
+    int tsunami_approach_time <- 460; // seconds (2 hours from Manila Trench to central VN)
     geometry tsunami_front;
     float coastal_x_coord;
     
@@ -87,8 +92,8 @@ global {
     rgb road_color <- rgb(71, 71, 71);      // Dark grey for roads
     
     // Car parameters
-    float car_speed_min <- 1.4;  // m/s
-    float car_speed_max <- 36.1; // m/s
+    float car_speed_min <- 15.0;  // m/s (54 km/h)
+    float car_speed_max <- 25.0;  // m/s (90 km/h)
     float car_acceleration <- 5.0;
     float car_deceleration <- 5.0;
     int cars_threshold_wait <- 5;
@@ -136,7 +141,7 @@ global {
     init {
         // Create physical environment first
         create building from: building_shapefile {
-            shape <- shape + 0.5; // Add small buffer to buildings
+            shape <- shape; 
         }
         create road from: road_shapefile;
         
@@ -360,6 +365,11 @@ species people skills: [moving] {
     reflex move when: !is_dead and !is_safe {
         switch type {
             match "local" {
+                // Randomize speed each step like NetLogo
+                speed <- gauss(speed, 1.0);  // Using normal distribution like NetLogo's random-normal
+                if (speed < human_speed_min) { speed <- human_speed_min; }
+                if (speed > human_speed_max) { speed <- human_speed_max; }
+                
                 point target <- (shelter closest_to self).location;
                 path path_to_target <- topology(road) path_between (self.location, target);
                 if (path_to_target != nil) {
@@ -368,7 +378,8 @@ species people skills: [moving] {
             }
             match "tourist" {
                 if (tourist_strategy = "wandering") {
-                    point possible_loc <- self.location + {rnd(-1,1) * speed, rnd(-1,1) * speed};
+                    // Increased random movement range to make it more visible (from -5 to 5)
+                    point possible_loc <- self.location + {rnd(-5,5) * speed, rnd(-5,5) * speed};
                     if (is_valid_location(possible_loc)) {
                         location <- possible_loc;
                     }
@@ -393,6 +404,37 @@ species people skills: [moving] {
                             location <- possible_loc;
                         }
                     }
+                } else if (tourist_strategy = "following crowd") {
+                    // Initialize variables for crowd search
+                    float current_angle <- 0.0;
+                    int max_crowd_size <- -1;
+                    float best_angle <- -1.0;
+                    
+                    // Search in 360 degrees with 45-degree increments
+                    loop while: current_angle < 360 {
+                        point check_point <- self.location + {cos(current_angle) * crowd_centroid_distance, sin(current_angle) * crowd_centroid_distance};
+                        
+                        if (is_valid_location(check_point)) {
+                            // Count people (tourists and locals) in the area
+                            int crowd_size <- length(people at_distance crowd_centroid_radius where (each.type in ["tourist", "local"]));
+                            
+                            // Update best direction if we found more people
+                            if (crowd_size > max_crowd_size) {
+                                max_crowd_size <- crowd_size;
+                                best_angle <- current_angle;
+                            }
+                        }
+                        
+                        current_angle <- current_angle + crowd_search_angle;
+                    }
+                    
+                    // Move towards the most crowded direction if found
+                    if (best_angle >= 0) {
+                        point target <- self.location + {cos(best_angle) * speed, sin(best_angle) * speed};
+                        if (is_valid_location(target)) {
+                            location <- target;
+                        }
+                    }
                 }
             }
             match "rescuer" {
@@ -404,7 +446,8 @@ species people skills: [moving] {
                         do follow path: path_to_target speed: speed;
                     }
                 } else {
-                    point possible_loc <- self.location + {rnd(-1,1) * speed * 1.2, rnd(-1,1) * speed * 1.2};
+                    // Increased random movement range for rescuers (from -5 to 5) with 1.2 speed multiplier
+                    point possible_loc <- self.location + {rnd(-4,4) * speed * 1.2, rnd(-5,5) * speed * 1.2};
                     if (is_valid_location(possible_loc)) {
                         location <- possible_loc;
                     }
@@ -512,9 +555,10 @@ species boat skills: [moving] {
 }
 
 experiment tsunami_simulation type: gui {
-    parameter "Number of locals" var: locals_number min: 0 max: 1000;
-    parameter "Number of tourists" var: tourists_number min: 0 max: 500;
-    parameter "Number of rescuers" var: rescuers_number min: 0 max: 100;
+    parameter "Number of locals" var: locals_number min: 0 max: 10000;
+    parameter "Number of tourists" var: tourists_number min: 0 max: 5000;
+    parameter "Number of rescuers" var: rescuers_number min: 0 max: 1000;
+    parameter "Tourist Movement Strategy" var: tourist_strategy among: ["wandering", "following rescuers or locals", "following crowd"] init: "following rescuers or locals";
     
     output {
         display main_display type: opengl {
