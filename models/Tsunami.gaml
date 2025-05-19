@@ -97,7 +97,7 @@ global {
     float car_acceleration <- 5.0;
     float car_deceleration <- 5.0;
     int cars_threshold_wait <- 5;
-    string car_strategy <- "always go ahead" among: ["always go ahead", "go out when congestion"];  // Removed unused strategy
+    string car_strategy <- "always go ahead" among: ["always go ahead", "go out when congestion"];
     
     // Car counters
     int cars_safe <- 0;
@@ -137,6 +137,13 @@ global {
             boats_in_danger <- boats_in_danger + 1;
         }
     }
+    
+    // Add to global section
+    int update_frequency <- 1; // Update every cycle by default
+    
+    // Add these variables to the global section
+    bool simulation_complete <- false;
+    int post_tsunami_delay <- 100; // Cycles to continue after tsunami passes through
     
     init {
         // Create physical environment first
@@ -256,6 +263,33 @@ global {
             color <- rgb(0,0,255,0.8);
         }
     }
+    
+    // Add this reflex to check if tsunami has moved through the entire map
+    reflex check_tsunami_end when: cycle >= tsunami_approach_time and not simulation_complete {
+        // Check if tsunami has reached the leftmost edge of the map
+        float leftmost_x <- min(cell_grid collect each.location.x);
+        
+        // Check if tsunami has passed through the map 
+        bool tsunami_passed_left_edge <- false;
+        if (tsunami_shape != nil and tsunami_shape.location.x <= leftmost_x) {
+            tsunami_passed_left_edge <- true;
+        }
+        
+        // Alternative method: Check if tsunami location is beyond leftmost edge
+        if (tsunami_front != nil and tsunami_front.location.x <= leftmost_x) {
+            tsunami_passed_left_edge <- true;
+        }
+        
+        // If tsunami has passed through the map
+        if (tsunami_passed_left_edge) {
+            // Let simulation run for a short time after tsunami passes to allow agents to react
+            if (cycle >= tsunami_approach_time + post_tsunami_delay) {
+                write "SIMULATION COMPLETE: Tsunami has passed through the map";
+                simulation_complete <- true;
+                do pause; // This will pause the simulation
+            }
+        }
+    }
 }
 
 // Species definitions
@@ -300,7 +334,9 @@ species people skills: [moving] {
     float agent_size;
     
     bool is_valid_location(point new_loc) {
-        return (valid_area covers new_loc) and (shape intersects land_area);
+        return (valid_area covers new_loc) and 
+               (cell_grid closest_to new_loc).is_land and 
+               (shape intersects land_area);
     }
     
     // Death checking reflex - runs every step
@@ -362,26 +398,74 @@ species people skills: [moving] {
     }
     
     // Different movement behaviors for each type
-    reflex move when: !is_dead and !is_safe {
+    reflex move when: !is_dead and !is_safe and (cycle mod update_frequency = 0) {
         switch type {
             match "local" {
                 // Randomize speed each step like NetLogo
-                speed <- gauss(speed, 1.0);  // Using normal distribution like NetLogo's random-normal
+                speed <- gauss(speed, 1.0);
                 if (speed < human_speed_min) { speed <- human_speed_min; }
                 if (speed > human_speed_max) { speed <- human_speed_max; }
                 
                 point target <- (shelter closest_to self).location;
                 path path_to_target <- topology(road) path_between (self.location, target);
+                
+                // Check if path exists and doesn't cross ocean
                 if (path_to_target != nil) {
-                    do follow path: path_to_target speed: speed;
+                    // Get next point in the path
+                    point next_point <- first(path_to_target.vertices);
+                    
+                    // Check if next point is on land before moving
+                    if ((cell_grid closest_to next_point).is_land) {
+                        do follow path: path_to_target speed: speed;
+                    } else {
+                        // Find a random land direction if path goes through ocean
+                        bool found_valid_move <- false;
+                        int safety_counter <- 0;
+                        int max_safety <- 100; // Safety measure to prevent CPU hogging
+                        
+                        loop while: (not found_valid_move) {
+                            // Try a random direction
+                            float random_angle <- rnd(360.0);
+                            point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
+                            
+                            // Check if the new point is on land
+                            if ((cell_grid closest_to possible_move).is_land) {
+                                // Try to find a new path from this point
+                                location <- possible_move;
+                                found_valid_move <- true;
+                            }
+                            
+                            // Safety exit - prevents infinite loops but allows agent to try again next cycle
+                            safety_counter <- safety_counter + 1;
+                            if (safety_counter >= max_safety) {
+                                break; // Exit this loop but the agent will try again next cycle
+                            }
+                        }
+                    }
                 }
             }
             match "tourist" {
                 if (tourist_strategy = "wandering") {
-                    // Increased random movement range to make it more visible (from -5 to 5)
-                    point possible_loc <- self.location + {rnd(-5,5) * speed, rnd(-5,5) * speed};
-                    if (is_valid_location(possible_loc)) {
-                        location <- possible_loc;
+                    // Try to find a valid location - can try indefinitely
+                    bool found_valid_location <- false;
+                    int safety_counter <- 0;
+                    int max_safety <- 100; // Safety measure to prevent CPU hogging
+                    
+                    loop while: (not found_valid_location) {
+                        // Generate a random possible location
+                        point possible_loc <- self.location + {rnd(-5,5) * speed, rnd(-5,5) * speed};
+                        
+                        // Check if location is valid (on land and within bounds)
+                        if (is_valid_location(possible_loc)) {
+                            location <- possible_loc;
+                            found_valid_location <- true;
+                        }
+                        
+                        // Safety exit - prevents infinite loops but allows agent to try again next cycle
+                        safety_counter <- safety_counter + 1;
+                        if (safety_counter >= max_safety) {
+                            break; // Exit this loop but the agent will try again next cycle
+                        }
                     }
                 } else if (tourist_strategy = "following rescuers or locals") {
                     if (leader = nil) {
@@ -438,18 +522,90 @@ species people skills: [moving] {
                 }
             }
             match "rescuer" {
+                // Randomize speed like we do for locals
+                speed <- gauss(speed, 1.0);
+                if (speed < human_speed_min) { speed <- human_speed_min; }
+                if (speed > human_speed_max) { speed <- human_speed_max; }
+                
                 list<people> nearby_tourists <- (people where (each.type = "tourist" and !each.is_safe)) at_distance radius_look;
+                
                 if (!empty(nearby_tourists)) {
+                    // If tourists found nearby, head to nearest shelter
                     point target <- (shelter closest_to self).location;
                     path path_to_target <- topology(road) path_between (self.location, target);
-                    if (path_to_target != nil) {
-                        do follow path: path_to_target speed: speed;
+                    
+                    // Use the exact same path checking logic as for locals
+                    if (path_to_target != nil and !empty(path_to_target.vertices)) {
+                        point next_point <- first(path_to_target.vertices);
+                        
+                        if ((cell_grid closest_to next_point).is_land) {
+                            do follow path: path_to_target speed: speed;
+                        } else {
+                            // Using same random direction logic as locals for ocean avoidance
+                            bool found_valid_move <- false;
+                            int safety_counter <- 0;
+                            int max_safety <- 100; // Safety measure to prevent CPU hogging
+                            
+                            loop while: (not found_valid_move) {
+                                // Try a random direction like locals do
+                                float random_angle <- rnd(360.0);
+                                point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
+                                
+                                // Check specifically for land, not using is_valid_location
+                                if ((cell_grid closest_to possible_move).is_land) {
+                                    location <- possible_move;
+                                    found_valid_move <- true;
+                                }
+                                
+                                // Safety exit - prevents infinite loops but allows agent to try again next cycle
+                                safety_counter <- safety_counter + 1;
+                                if (safety_counter >= max_safety) {
+                                    break; // Exit this loop but the agent will try again next cycle
+                                }
+                            }
+                        }
+                    } else {
+                        // Same random direction logic for when no path exists
+                        bool found_valid_move <- false;
+                        int safety_counter <- 0;
+                        int max_safety <- 100; // Safety measure to prevent CPU hogging
+                        
+                        loop while: (not found_valid_move) {
+                            float random_angle <- rnd(360.0);
+                            point possible_move <- self.location + {cos(random_angle) * speed * 1.2, sin(random_angle) * speed * 1.2};
+                            
+                            if ((cell_grid closest_to possible_move).is_land) {
+                                location <- possible_move;
+                                found_valid_move <- true;
+                            }
+                            
+                            // Safety exit - prevents infinite loops but allows agent to try again next cycle
+                            safety_counter <- safety_counter + 1;
+                            if (safety_counter >= max_safety) {
+                                break; // Exit this loop but the agent will try again next cycle
+                            }
+                        }
                     }
                 } else {
-                    // Increased random movement range for rescuers (from -5 to 5) with 1.2 speed multiplier
-                    point possible_loc <- self.location + {rnd(-4,4) * speed * 1.2, rnd(-5,5) * speed * 1.2};
-                    if (is_valid_location(possible_loc)) {
-                        location <- possible_loc;
+                    // Random wandering when no tourists
+                    bool found_valid_move <- false;
+                    int safety_counter <- 0;
+                    int max_safety <- 100; // Safety measure to prevent CPU hogging
+                    
+                    loop while: (not found_valid_move) {
+                        float random_angle <- rnd(360.0);
+                        point possible_move <- self.location + {cos(random_angle) * speed * 1.2, sin(random_angle) * speed * 1.2};
+                        
+                        if ((cell_grid closest_to possible_move).is_land) {
+                            location <- possible_move;
+                            found_valid_move <- true;
+                        }
+                        
+                        // Safety exit - prevents infinite loops but allows agent to try again next cycle
+                        safety_counter <- safety_counter + 1;
+                        if (safety_counter >= max_safety) {
+                            break; // Exit this loop but the agent will try again next cycle
+                        }
                     }
                 }
             }
@@ -488,54 +644,115 @@ species car skills: [moving] {
         }
     }
     
-    reflex move when: !is_dead and !is_safe {
+    reflex move when: !is_dead and !is_safe and (cycle mod update_frequency = 0) {
         // Strategy 1: Always go ahead
         if (car_strategy = "always go ahead") {
             shelter target_shelter <- shuffle(shelter) with_min_of (each distance_to self);
             path path_to_target <- topology(road) path_between (self.location, target_shelter.location);
-            if (path_to_target != nil) {
-                // Check for car ahead
-                list<car> nearby_cars <- car at_distance 10.0;
-                car car_ahead <- !empty(nearby_cars) ? nearby_cars first_with (each.location = location + {cos(heading), sin(heading)} * 10.0) : nil;
+            
+            if (path_to_target != nil and !empty(path_to_target.vertices)) {
+                // Check if next point is on land (ocean avoidance)
+                point next_point <- first(path_to_target.vertices);
                 
-                if (car_ahead != nil) {
-                    // Slow down
-                    speed <- speed - car_deceleration;
+                if ((cell_grid closest_to next_point).is_land) {
+                    // Check for agents blocking the way
+                    list<people> people_ahead <- people at_distance 5.0;
+                    list<car> cars_ahead <- car at_distance 5.0;
+                    
+                    if (!empty(people_ahead) or !empty(cars_ahead)) {
+                        // Path is blocked, wait in place
+                        // Could add a waiting animation or state indicator here
+                    } else {
+                        // Path is clear, adjust speed and move
+                        // Speed up if no car ahead
+                        speed <- speed + car_acceleration;
+                        // Clamp speed
+                        speed <- min([max([speed, car_speed_min]), car_speed_max]);
+                        do follow path: path_to_target speed: speed;
+                    }
                 } else {
-                    // Speed up
-                    speed <- speed + car_acceleration;
+                    // Next point is in ocean, find random land movement
+                    int safety_counter <- 0;
+                    int max_safety <- 100; // Safety measure to prevent CPU hogging
+                    bool found_valid_move <- false;
+                    
+                    loop while: (not found_valid_move) {
+                        float random_angle <- rnd(360.0);
+                        point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
+                        
+                        if ((cell_grid closest_to possible_move).is_land) {
+                            location <- possible_move;
+                            found_valid_move <- true;
+                        }
+                        
+                        // Safety exit - prevents infinite loops but allows agent to try again next cycle
+                        safety_counter <- safety_counter + 1;
+                        if (safety_counter >= max_safety) {
+                            break; // Exit this loop but the agent will try again next cycle
+                        }
+                    }
                 }
-                // Clamp speed
-                speed <- min([max([speed, car_speed_min]), car_speed_max]);
-                do follow path: path_to_target speed: speed;
             }
         }
-        // Strategy 3: Go out when congestion
+        // Strategy: Go out when congestion
         else if (car_strategy = "go out when congestion") {
             shelter target_shelter <- shuffle(shelter) with_min_of (each distance_to self);
             path path_to_target <- topology(road) path_between (self.location, target_shelter.location);
-            if (path_to_target != nil) {
-                list<car> nearby_cars <- car at_distance 10.0;
-                if (!empty(nearby_cars)) {
-                    cars_time_wait <- cars_time_wait + 1;
-                    if (cars_time_wait >= cars_threshold_wait) {
-                        // Create people from car occupants
-                        create people number: nb_people_in {
-                            type <- "local";
-                            location <- myself.location;
-                            color <- #yellow;
-                            is_dead <- false;
-                            is_safe <- false;
-                            speed <- rnd(human_speed_min, human_speed_max);
+            
+            if (path_to_target != nil and !empty(path_to_target.vertices)) {
+                // Check if next point is on land
+                point next_point <- first(path_to_target.vertices);
+                
+                if ((cell_grid closest_to next_point).is_land) {
+                    // Check for people or cars ahead
+                    list<people> people_ahead <- people at_distance 5.0;
+                    list<car> cars_ahead <- car at_distance 5.0;
+                    
+                    if (!empty(people_ahead) or !empty(cars_ahead)) {
+                        // There are agents blocking the way
+                        cars_time_wait <- cars_time_wait + 1;
+                        
+                        if (cars_time_wait >= cars_threshold_wait) {
+                            // Create people from car occupants
+                            create people number: nb_people_in {
+                                type <- "local";
+                                location <- myself.location;
+                                color <- #yellow;
+                                is_dead <- false;
+                                is_safe <- false;
+                                speed <- rnd(human_speed_min, human_speed_max);
+                            }
+                            cars_in_danger <- cars_in_danger - 1;
+                            do die;
                         }
-                        cars_in_danger <- cars_in_danger - 1;
-                        do die;
+                    } else {
+                        // Path is clear
+                        cars_time_wait <- 0;
+                        speed <- speed + car_acceleration;
+                        speed <- min([max([speed, car_speed_min]), car_speed_max]);
+                        do follow path: path_to_target speed: speed;
                     }
                 } else {
-                    cars_time_wait <- 0;
-                    speed <- speed + car_acceleration;
-                    speed <- min([max([speed, car_speed_min]), car_speed_max]);
-                    do follow path: path_to_target speed: speed;
+                    // Next point is in ocean, use random land movement
+                    int safety_counter <- 0;
+                    int max_safety <- 100; // Safety measure to prevent CPU hogging
+                    bool found_valid_move <- false;
+                    
+                    loop while: (not found_valid_move) {
+                        float random_angle <- rnd(360.0);
+                        point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
+                        
+                        if ((cell_grid closest_to possible_move).is_land) {
+                            location <- possible_move;
+                            found_valid_move <- true;
+                        }
+                        
+                        // Safety exit - prevents infinite loops but allows agent to try again next cycle
+                        safety_counter <- safety_counter + 1;
+                        if (safety_counter >= max_safety) {
+                            break; // Exit this loop but the agent will try again next cycle
+                        }
+                    }
                 }
             }
         }
@@ -559,6 +776,7 @@ experiment tsunami_simulation type: gui {
     parameter "Number of tourists" var: tourists_number min: 0 max: 5000;
     parameter "Number of rescuers" var: rescuers_number min: 0 max: 1000;
     parameter "Tourist Movement Strategy" var: tourist_strategy among: ["wandering", "following rescuers or locals", "following crowd"] init: "following rescuers or locals";
+    parameter "Car Movement Strategy" var: car_strategy among:["always go ahead", "go out when congestion"];
     
     output {
         display main_display type: opengl {
@@ -588,15 +806,15 @@ experiment tsunami_simulation type: gui {
                 float x <- world.shape.width * 0.8;
                 float y <- world.shape.height * 0.95;
                 
-                draw "Shelter" at: {x, y} color: #black font: font("Arial", 14, #bold);
-                draw circle(10) at: {x + 50, y} color: rgb(0, 255, 0, 0.6) border: #black;
+//                draw "Shelter" at: {x, y} color: #black font: font("Arial", 14, #bold);
+//                draw circle(10) at: {x + 50, y} color: rgb(0, 255, 0, 0.6) border: #black;
                 
                 // Population counts
-                draw "Locals: " + length(people where (each.type = "local")) at: {x, y - 30} color: #black;
-                draw "Tourists: " + length(people where (each.type = "tourist")) at: {x, y - 50} color: #black;
-                draw "Rescuers: " + length(people where (each.type = "rescuer")) at: {x, y - 70} color: #black;
-                draw "Cars: " + length(car) at: {x, y - 90} color: #black;
-                draw "Boats: " + length(boat) at: {x, y - 110} color: #black;
+//                draw "Locals: " + length(people where (each.type = "local")) at: {x, y - 30} color: #black;
+//                draw "Tourists: " + length(people where (each.type = "tourist")) at: {x, y - 50} color: #black;
+//                draw "Rescuers: " + length(people where (each.type = "rescuer")) at: {x, y - 70} color: #black;
+//                draw "Cars: " + length(car) at: {x, y - 90} color: #black;
+//                draw "Boats: " + length(boat) at: {x, y - 110} color: #black;
             }
         }
         
@@ -610,5 +828,31 @@ experiment tsunami_simulation type: gui {
         monitor "Dead cars" value: cars_dead;
         monitor "Safe boats" value: boats_safe;
         monitor "Dead boats" value: boats_dead;
+        // Add separate charts for safe and dead agents
+        display "Safe Agents Chart" {
+            chart "Safe Agents Status" type: series {
+                // Safe agents data
+                data "Safe Locals" value: locals_safe color: rgb(255, 191, 0);
+                data "Safe Tourists" value: tourists_safe color: #violet;
+                data "Safe Rescuers" value: rescuers_safe color: #blue;
+            }
+        }
+        
+        display "Dead Agents Chart" {
+            chart "Dead Agents Status" type: series {
+                // Dead agents data
+                data "Dead Locals" value: locals_dead color: rgb(255, 191, 0);
+                data "Dead Tourists" value: tourists_dead color: #violet;
+                data "Dead Rescuers" value: rescuers_dead color: #blue;
+            }
+        }
+        
+        // Keep the overall pie chart
+        display "Overall Safety Status" {
+            chart "Overall Safety vs Casualties" type: pie {
+                data "Total Safe" value: locals_safe + tourists_safe + rescuers_safe color: #green;
+                data "Total Casualties" value: locals_dead + tourists_dead + rescuers_dead color: #red;
+            }
+        }
     }
 }
