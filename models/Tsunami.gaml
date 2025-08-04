@@ -45,10 +45,10 @@ global {
     float human_speed_max <- 10.0; // 36 km/h maximum speed (running)
     
     // Population counts and sizes
-    int locals_number <- 100;
+    int locals_number <- 200;
     float locals_size <- 4.0;
     
-    int tourists_number <- 50;
+    int tourists_number <- 100;
     float tourists_size <- 4.0;
     
     int rescuers_number <- 20;
@@ -145,6 +145,19 @@ global {
     bool simulation_complete <- false;
     int post_tsunami_delay <- 100; // Cycles to continue after tsunami passes through
     
+    // Add tsunami segments parameters like NetLogo
+    int tsunami_nb_segments <- 30;
+    float tsunami_length_segment;
+    list<float> tsunami_curr_coord <- [];
+    list<float> tsunami_current_speed <- [];
+    list<float> coastal_coord_x <- [];
+    list<float> tsunami_curr_height <- []; // For future development
+    
+    // Tsunami speed parameters like NetLogo
+    float tsunami_speed_avg <- 44.3;  // m/s
+    float tsunami_speed_std <- 0.5;
+    float scale_factor <- 1.0; // Will be calculated based on GIS
+    
     init {
         // Create physical environment first
         create building from: building_shapefile {
@@ -200,6 +213,7 @@ global {
             is_dead <- false;
             location <- any_location_in(one_of(road));
         }
+        locals_in_danger <- locals_number; // Initialize counter
         
         create people number: tourists_number {
             type <- "tourist";
@@ -212,6 +226,7 @@ global {
             leader <- nil;
             location <- any_location_in(one_of(road));
         }
+        tourists_in_danger <- tourists_number; // Initialize counter
         
         create people number: rescuers_number {
             type <- "rescuer";
@@ -224,12 +239,48 @@ global {
             nb_tourists_to_rescue <- 0;
             location <- any_location_in(one_of(road));
         }
+        rescuers_in_danger <- rescuers_number; // Initialize counter
         
-        // Initialize tsunami parameters
-        coastal_x_coord <- max(building collect each.location.x);
-        tsunami_front <- square(1) at_location {max(world.shape.width * 1.2, coastal_x_coord + 500), world.shape.height/2};
-        tsunami_shape <- rectangle(wave_width, world.shape.height) at_location {max(world.shape.width * 1.2, coastal_x_coord + 500), world.shape.height/2};
-        flood_areas <- [];
+        // Initialize tsunami segments like NetLogo
+        tsunami_length_segment <- world.shape.height / tsunami_nb_segments;
+        
+        // Calculate world bounds for proper positioning
+        geometry world_envelope <- envelope(world.shape);
+        float world_min_y <- world_envelope.location.y - world_envelope.height/2;
+        float world_max_y <- world_envelope.location.y + world_envelope.height/2;
+        float world_max_x <- world_envelope.location.x + world_envelope.width/2;
+        
+        loop i from: 0 to: tsunami_nb_segments - 1 {
+            // Initial position (start from right edge + small offset, ensuring visibility)
+            tsunami_curr_coord <- tsunami_curr_coord + (world_max_x + rnd(10.0, 50.0));
+            
+            // Each segment has slightly different speed
+            tsunami_current_speed <- tsunami_current_speed + gauss(tsunami_speed_avg, tsunami_speed_std);
+            tsunami_curr_height <- tsunami_curr_height + 0.0; // For future use
+            
+            // Calculate segment Y boundaries properly within world bounds
+            float segment_y_min <- world_min_y + (tsunami_length_segment * i);
+            float segment_y_max <- world_min_y + (tsunami_length_segment * (i + 1));
+            
+            // Ensure segment boundaries don't exceed world bounds
+            segment_y_min <- max([world_min_y, segment_y_min]);
+            segment_y_max <- min([world_max_y, segment_y_max]);
+            
+            // Find coastal coordinate for each segment
+            float max_x_coastal <- world_envelope.location.x - world_envelope.width/2; // Start from left edge
+            ask road where (
+                each.location.y >= segment_y_min and
+                each.location.y <= segment_y_max
+            ) {
+                if (location.x > max_x_coastal) {
+                    max_x_coastal <- location.x;
+                }
+            }
+            coastal_coord_x <- coastal_coord_x + (max_x_coastal + rnd(10.0, 30.0));
+        }
+        
+        // Remove single tsunami initialization
+        // tsunami_front and tsunami_shape will be handled per segment
         
         // Initialize cars
         do init_cars();
@@ -238,56 +289,213 @@ global {
         do init_boats();
     }
     
+    // Sửa phần update_tsunami để đảm bảo tốc độ và màu sắc đồng nhất
     reflex update_tsunami when: cycle >= tsunami_approach_time {
-        // Update tsunami position
-        float tsunami_movement <- tsunami_speed * step;
-        tsunami_front <- tsunami_front translated_by {-tsunami_movement, 0};
-        tsunami_shape <- tsunami_shape translated_by {-tsunami_movement, 0};
-        
-        // Update flooding visualization
-        ask cell_grid overlapping tsunami_shape {
-            if !is_flooded {
-                is_flooded <- true;
-                flood_intensity <- 0.3;
+        // Update each tsunami segment separately
+        loop i from: 0 to: tsunami_nb_segments - 1 {
+            float segment_speed <- tsunami_current_speed[i];
+            float segment_coord <- tsunami_curr_coord[i];
+            float coastal_x <- coastal_coord_x[i];
+            
+            // NEW LOGIC: Keep constant speed in ocean, only decrease when hitting land
+            if (segment_coord >= coastal_x) {
+                // Still in ocean - maintain CONSTANT speed (no randomness)
+                tsunami_current_speed[i] <- tsunami_speed_avg; // Fixed speed in ocean
+            } else {
+                // Reached coast - decrease speed GRADUALLY
+                if (segment_speed > 0) {
+                    // More gradual deceleration (5-15 instead of 10-30)
+                    segment_speed <- segment_speed - rnd(5.0, 15.0);
+                    if (segment_speed < 0) {
+                        segment_speed <- 0.0;
+                    }
+                    tsunami_current_speed[i] <- segment_speed;
+                }
             }
-        }
-        
-        // Increase flood intensity for previously flooded cells
-        ask cell_grid where (each.is_flooded) {
-            flood_intensity <- min([1.0, flood_intensity + 0.01]);
-        }
-        
-        // Update road flooding using proper GAMA spatial operators
-        ask road where (each.shape intersects tsunami_shape) {
-            is_flooded <- true;
-            color <- rgb(0,0,255,0.8);
+            
+            // Calculate scaled movement speed
+            float tsunami_speed_scale <- segment_speed * scale_factor * 60.0 / 3.6;
+            
+            // Update segment position
+            tsunami_curr_coord[i] <- segment_coord - tsunami_speed_scale * step;
+            
+            // Define segment boundaries properly within world bounds
+            geometry world_envelope <- envelope(world.shape);
+            float world_min_y <- world_envelope.location.y - world_envelope.height/2;
+            float world_max_y <- world_envelope.location.y + world_envelope.height/2;
+            float segment_y_min <- world_min_y + (tsunami_length_segment * i);
+            float segment_y_max <- world_min_y + (tsunami_length_segment * (i + 1));
+            
+            // Ensure segment boundaries don't exceed world bounds
+            segment_y_min <- max([world_min_y, segment_y_min]);
+            segment_y_max <- min([world_max_y, segment_y_max]);
+            
+            // IMPROVED FLOODING LOGIC - 100% flooding in ocean, probabilistic on land
+            ask cell_grid where (
+                each.location.x >= tsunami_curr_coord[i] and
+                each.location.y >= segment_y_min and
+                each.location.y <= segment_y_max
+            ) {
+                if (!is_flooded) {
+                    if (!is_land) {
+                        // OCEAN - 100% guaranteed flooding for consistency
+                        is_flooded <- true;
+                        color <- #blue;
+                        flood_intensity <- 0.6; // Higher intensity for ocean
+                    } else if (shelter_id = -1) {
+                        // LAND - probabilistic flooding (50% chance)
+                        if (rnd(10) < 5) {
+                            is_flooded <- true;
+                            color <- rgb(0, 100, 255, 0.7); // Different blue for land
+                            flood_intensity <- 0.3; // Lower initial intensity on land
+                        }
+                    }
+                }
+                
+                // Intensity growth rates differ by terrain type
+                if (is_flooded) {
+                    if (!is_land) {
+                        // OCEAN - fast intensity growth (70% chance)
+                        if (rnd(10) < 7) {
+                            flood_intensity <- min([1.0, flood_intensity + 0.2]);
+                            color <- rgb(0, 0, int(255 * flood_intensity));
+                        }
+                    } else {
+                        // LAND - slower intensity growth (40% chance)
+                        if (rnd(10) < 4) {
+                            flood_intensity <- min([0.8, flood_intensity + 0.1]);
+                            color <- rgb(0, 100, int(200 * flood_intensity), 0.7);
+                        }
+                    }
+                }
+                
+                // GUARANTEED flooding for cells far behind tsunami front
+                if (!is_flooded and tsunami_curr_coord[i] - location.x > 50.0) {
+                    is_flooded <- true;
+                    if (!is_land) {
+                        flood_intensity <- 1.0;
+                        color <- rgb(0, 0, 200); // Deep blue for ocean
+                    } else {
+                        flood_intensity <- 0.7;
+                        color <- rgb(0, 100, 180, 0.7); // Blue-gray for flooded land
+                    }
+                }
+            }
+            
+            // Update road flooding consistently
+            ask road where (
+                each.location.x >= tsunami_curr_coord[i] and
+                each.location.y >= segment_y_min and
+                each.location.y <= segment_y_max
+            ) {
+                // Increased probability (70% instead of 50%)
+                if (!is_flooded and rnd(10) < 7) {
+                    is_flooded <- true;
+                    color <- rgb(0, 0, 255, 0.8);
+                }
+            }
         }
     }
     
-    // Add this reflex to check if tsunami has moved through the entire map
-    reflex check_tsunami_end when: cycle >= tsunami_approach_time and not simulation_complete {
-        // Check if tsunami has reached the leftmost edge of the map
-        float leftmost_x <- min(cell_grid collect each.location.x);
+    // Display evacuation progress every 50 cycles
+    reflex display_progress when: cycle >= tsunami_approach_time and (cycle mod 50 = 0) and not simulation_complete {
+        int total_people <- locals_number + tourists_number + rescuers_number;
+        int total_safe <- locals_safe + tourists_safe + rescuers_safe;
+        int total_dead <- locals_dead + tourists_dead + rescuers_dead;
+        int total_in_danger <- locals_in_danger + tourists_in_danger + rescuers_in_danger;
         
-        // Check if tsunami has passed through the map 
-        bool tsunami_passed_left_edge <- false;
-        if (tsunami_shape != nil and tsunami_shape.location.x <= leftmost_x) {
-            tsunami_passed_left_edge <- true;
-        }
+        write "=== Evacuation Progress (Cycle " + cycle + ") ===";
+        write "Safe: " + total_safe + "/" + total_people + " (" + string(total_safe * 100.0 / total_people) + "%)";
+        write "Casualties: " + total_dead + "/" + total_people + " (" + string(total_dead * 100.0 / total_people) + "%)";
+        write "Still in danger: " + total_in_danger + "/" + total_people;
         
-        // Alternative method: Check if tsunami location is beyond leftmost edge
-        if (tsunami_front != nil and tsunami_front.location.x <= leftmost_x) {
-            tsunami_passed_left_edge <- true;
-        }
+        // Show improved tsunami progress
+        geometry world_envelope <- envelope(world.shape);
+        float world_left_edge <- world_envelope.location.x - world_envelope.width/2;
         
-        // If tsunami has passed through the map
-        if (tsunami_passed_left_edge) {
-            // Let simulation run for a short time after tsunami passes to allow agents to react
-            if (cycle >= tsunami_approach_time + post_tsunami_delay) {
-                write "SIMULATION COMPLETE: Tsunami has passed through the map";
-                simulation_complete <- true;
-                do pause; // This will pause the simulation
+        // Calculate coverage based on leftmost active segment
+        float leftmost_active_tsunami <- world_envelope.location.x + world_envelope.width/2;
+        int active_segments <- 0;
+        int stopped_segments <- 0;
+        
+        loop i from: 0 to: tsunami_nb_segments - 1 {
+            if (tsunami_current_speed[i] > 0.1) {
+                active_segments <- active_segments + 1;
+                if (tsunami_curr_coord[i] < leftmost_active_tsunami) {
+                    leftmost_active_tsunami <- tsunami_curr_coord[i];
+                }
+            } else {
+                stopped_segments <- stopped_segments + 1;
             }
+        }
+        
+        float map_coverage <- (world_envelope.location.x + world_envelope.width/2 - leftmost_active_tsunami) / world_envelope.width * 100.0;
+        map_coverage <- max([0.0, min([100.0, map_coverage])]);
+        
+        write "Tsunami coverage: " + string(map_coverage) + "% of map";
+        write "Active segments: " + active_segments + "/" + tsunami_nb_segments + ", Stopped: " + stopped_segments;
+    }
+
+    // Check simulation end condition - improved logic
+    reflex check_tsunami_end when: cycle >= tsunami_approach_time and not simulation_complete {
+        geometry world_envelope <- envelope(world.shape);
+        float world_left_edge <- world_envelope.location.x - world_envelope.width/2;
+        
+        // Method 1: Check if any segment has completely passed through the map
+        bool tsunami_passed_through <- false;
+        loop i from: 0 to: tsunami_nb_segments - 1 {
+            // If any segment has moved past the left edge of the world
+            if (tsunami_curr_coord[i] <= world_left_edge - wave_width) {
+                tsunami_passed_through <- true;
+                break;
+            }
+        }
+        
+        // Method 2: Check if all segments have zero speed (stopped moving)
+        bool all_segments_stopped <- true;
+        loop i from: 0 to: tsunami_nb_segments - 1 {
+            if (tsunami_current_speed[i] > 0.1) { // Small threshold for floating point precision
+                all_segments_stopped <- false;
+                break;
+            }
+        }
+        
+        // Method 3: Calculate actual coverage based on leftmost active segment
+        float leftmost_active_tsunami <- world_envelope.location.x + world_envelope.width/2; // Start from right edge
+        loop i from: 0 to: tsunami_nb_segments - 1 {
+            // Only consider segments that are still moving or within the world bounds
+            if (tsunami_current_speed[i] > 0.1 or tsunami_curr_coord[i] > world_left_edge) {
+                if (tsunami_curr_coord[i] < leftmost_active_tsunami) {
+                    leftmost_active_tsunami <- tsunami_curr_coord[i];
+                }
+            }
+        }
+        
+        float map_coverage <- (world_envelope.location.x + world_envelope.width/2 - leftmost_active_tsunami) / world_envelope.width * 100.0;
+        map_coverage <- max([0.0, min([100.0, map_coverage])]);
+        
+        // End simulation when ANY of these conditions is met:
+        if (tsunami_passed_through or all_segments_stopped or map_coverage >= 100.0) {
+            write "=== SIMULATION COMPLETE ===";
+            if (tsunami_passed_through) {
+                write "Tsunami has passed through the map completely";
+            } else if (all_segments_stopped) {
+                write "All tsunami segments have stopped moving";
+            } else {
+                write "Tsunami has covered 100% of the map";
+            }
+            write "Final map coverage: " + string(map_coverage) + "%";
+            write "Final Statistics:";
+            write "- Locals: " + locals_safe + " safe, " + locals_dead + " casualties";
+            write "- Tourists: " + tourists_safe + " safe, " + tourists_dead + " casualties";
+            write "- Rescuers: " + rescuers_safe + " safe, " + rescuers_dead + " casualties";
+            write "- Cars: " + cars_safe + " safe, " + cars_dead + " casualties";
+            write "- Total evacuation rate: " + 
+                string((locals_safe + tourists_safe + rescuers_safe) * 100.0 / 
+                       (locals_number + tourists_number + rescuers_number)) + "%";
+            
+            simulation_complete <- true;
+            do pause;
         }
     }
 }
@@ -341,9 +549,13 @@ species people skills: [moving] {
     
     // Death checking reflex - runs every step
     reflex check_death when: !is_dead and !is_safe {
-        // Check if current location is flooded using proper GAMA spatial operators
+        // Check if current location is flooded using both road and cell_grid
         road current_road <- road closest_to self;
-        if (current_road != nil and current_road.is_flooded) {
+        cell_grid current_cell <- cell_grid closest_to self;
+        
+        // Agent dies if either the road OR the cell is flooded
+        if ((current_road != nil and current_road.is_flooded) or 
+            (current_cell != nil and current_cell.is_flooded)) {
             is_dead <- true;
             color <- #red;
             
@@ -445,8 +657,15 @@ species people skills: [moving] {
                 }
             }
             match "tourist" {
+                // Add random speed variation for tourists, similar to locals and rescuers
+                // This matches the NetLogo implementation where all agents have randomized speed
+                speed <- gauss(speed, 1.0);
+                if (speed < human_speed_min) { speed <- human_speed_min; }
+                if (speed > human_speed_max) { speed <- human_speed_max; }
+                
                 if (tourist_strategy = "wandering") {
-                    // Try to find a valid location - can try indefinitely
+                    // Wandering strategy: tourists move randomly
+                    // Try to find a valid location with safety counter to prevent infinite loops
                     bool found_valid_location <- false;
                     int safety_counter <- 0;
                     int max_safety <- 100; // Safety measure to prevent CPU hogging
@@ -468,9 +687,12 @@ species people skills: [moving] {
                         }
                     }
                 } else if (tourist_strategy = "following rescuers or locals") {
+                    // Following strategy: tourists follow rescuers or locals
                     if (leader = nil) {
+                        // Try to find a rescuer first (priority)
                         list<people> potential_leaders <- (people where (each.type = "rescuer")) at_distance radius_look;
                         if (empty(potential_leaders)) {
+                            // If no rescuers nearby, look for locals
                             potential_leaders <- (people where (each.type = "local")) at_distance radius_look;
                         }
                         if (!empty(potential_leaders)) {
@@ -478,133 +700,192 @@ species people skills: [moving] {
                         }
                     }
                     if (leader != nil) {
+                        // Follow the leader using road network if possible
                         path path_to_leader <- topology(road) path_between (self.location, leader.location);
                         if (path_to_leader != nil) {
                             do follow path: path_to_leader speed: speed;
                         }
                     } else {
+                        // No leader found, perform small random movement
                         point possible_loc <- self.location + {rnd(-1,1) * speed, rnd(-1,1) * speed};
                         if (is_valid_location(possible_loc)) {
                             location <- possible_loc;
                         }
                     }
                 } else if (tourist_strategy = "following crowd") {
-                    // Initialize variables for crowd search
-                    float current_angle <- 0.0;
-                    int max_crowd_size <- -1;
+                    // Crowd following strategy: Move toward densest population areas
+                    // Implementation follows exact NetLogo algorithm 
+                    float centroid_distance <- radius_look / 2.0;
+                    float centroid_radius <- radius_look / 2.0;
+                    float angle_look <- 0.0;
+                    int max_nb_crowd <- -1;
                     float best_angle <- -1.0;
+                    bool can_move_angle <- false;
                     
-                    // Search in 360 degrees with 45-degree increments
-                    loop while: current_angle < 360 {
-                        point check_point <- self.location + {cos(current_angle) * crowd_centroid_distance, sin(current_angle) * crowd_centroid_distance};
+                    // Check all 8 directions (45-degree increments like NetLogo)
+                    loop while: (angle_look < 360) {
+                        // Step 1: Check if can move 1 step in this direction
+                        float check_x <- location.x + cos(angle_look) * 1.0;
+                        float check_y <- location.y + sin(angle_look) * 1.0;
+                        point check_point <- {check_x, check_y};
                         
-                        if (is_valid_location(check_point)) {
-                            // Count people (tourists and locals) in the area
-                            int crowd_size <- length(people at_distance crowd_centroid_radius where (each.type in ["tourist", "local"]));
-                            
-                            // Update best direction if we found more people
-                            if (crowd_size > max_crowd_size) {
-                                max_crowd_size <- crowd_size;
-                                best_angle <- current_angle;
+                        // Find the cell at this check point
+                        cell_grid check_cell <- cell_grid closest_to check_point;
+                        can_move_angle <- false;
+                        
+                        if (check_cell != nil and check_cell.is_land and !check_cell.is_flooded) {
+                            // Check if people can move to this patch (equivalent to can-people-move-to-patch)
+                            int people_count <- length(people overlapping check_cell);
+                            if (people_count <= people_patch_threshold) {
+                                can_move_angle <- true;
                             }
                         }
                         
-                        current_angle <- current_angle + crowd_search_angle;
+                        // Step 2: If can move, check crowd density at centroid
+                        if (can_move_angle) {
+                            float centroid_x <- location.x + cos(angle_look) * centroid_distance;
+                            float centroid_y <- location.y + sin(angle_look) * centroid_distance;
+                            point centroid_point <- {centroid_x, centroid_y};
+                            
+                            // Count tourists and locals in radius around this centroid point
+                            list<people> crowd_people <- people where (
+                                (each.type = "tourist" or each.type = "local") and 
+                                (each distance_to centroid_point <= centroid_radius)
+                            );
+                            int nb_crowd <- length(crowd_people);
+                            
+                            // Step 3: Update best direction
+                            if (nb_crowd > max_nb_crowd) {
+                                max_nb_crowd <- nb_crowd;
+                                best_angle <- angle_look;
+                            }
+                        }
+                        
+                        // Increment angle by 45 degrees like NetLogo
+                        angle_look <- angle_look + 45.0;
                     }
                     
-                    // Move towards the most crowded direction if found
+                    // Step 4: Move towards best direction if found
                     if (best_angle >= 0) {
-                        point target <- self.location + {cos(best_angle) * speed, sin(best_angle) * speed};
-                        if (is_valid_location(target)) {
-                            location <- target;
+                        float target_x <- location.x + cos(best_angle) * speed;
+                        float target_y <- location.y + sin(best_angle) * speed;
+                        point target <- {target_x, target_y};
+                        
+                        // Validate target location
+                        if (valid_area covers target) {
+                            cell_grid target_cell <- cell_grid closest_to target;
+                            if (target_cell.is_land and !target_cell.is_flooded) {
+                                location <- target;
+                            }
                         }
                     }
                 }
             }
             match "rescuer" {
-                // Randomize speed like we do for locals
+                // Randomize speed each step like locals and tourists (matching NetLogo behavior)
                 speed <- gauss(speed, 1.0);
                 if (speed < human_speed_min) { speed <- human_speed_min; }
                 if (speed > human_speed_max) { speed <- human_speed_max; }
                 
-                list<people> nearby_tourists <- (people where (each.type = "tourist" and !each.is_safe)) at_distance radius_look;
+                // SAFETY CHECK: Calculate distance to nearest tsunami segment
+                float min_tsunami_distance <- 999999.0;
+                bool immediate_danger <- false;
                 
-                if (!empty(nearby_tourists)) {
-                    // If tourists found nearby, head to nearest shelter
+                // Check current cell flooding status
+                cell_grid current_cell <- cell_grid closest_to self;
+                road current_road <- road closest_to self;
+                if ((current_cell != nil and current_cell.is_flooded) or 
+                    (current_road != nil and current_road.is_flooded)) {
+                    immediate_danger <- true;
+                }
+                
+                // Calculate minimum distance to any tsunami segment
+                loop i from: 0 to: tsunami_nb_segments - 1 {
+                    float distance_to_tsunami <- abs(location.x - tsunami_curr_coord[i]);
+                    if (distance_to_tsunami < min_tsunami_distance) {
+                        min_tsunami_distance <- distance_to_tsunami;
+                    }
+                }
+                
+                // EMERGENCY EVACUATION: If tsunami is too close (<150m) or immediate danger, evacuate
+                if (immediate_danger or min_tsunami_distance < 150.0) {
+                    // Force evacuation to nearest shelter with increased speed
                     point target <- (shelter closest_to self).location;
                     path path_to_target <- topology(road) path_between (self.location, target);
                     
-                    // Use the exact same path checking logic as for locals
                     if (path_to_target != nil and !empty(path_to_target.vertices)) {
-                        point next_point <- first(path_to_target.vertices);
+                        // Emergency evacuation with 50% speed boost
+                        do follow path: path_to_target speed: (speed * 1.5);
+                    } else {
+                        // Direct movement if no path available
+                        do goto target: target speed: (speed * 1.5);
+                    }
+                } else {
+                    // NORMAL RESCUE OPERATIONS: Continue rescue mission when safe distance
+                    
+                    // Find nearby tourists within radius_look (matching NetLogo: count tourists in-radius radius_look)
+                    list<people> nearby_tourists <- (people where (each.type = "tourist" and !each.is_safe and !each.is_dead)) at_distance radius_look;
+                    
+                    if (!empty(nearby_tourists)) {
+                        // STRATEGY 1: Lead tourists to shelter when found
+                        // This matches NetLogo logic: when nb_tourists > 0, rescuer leads tourists to safety
+                        point target <- (shelter closest_to self).location;
+                        path path_to_target <- topology(road) path_between (self.location, target);
                         
-                        if ((cell_grid closest_to next_point).is_land) {
+                        if (path_to_target != nil and !empty(path_to_target.vertices)) {
+                            // Follow path with normal speed when guiding tourists
                             do follow path: path_to_target speed: speed;
                         } else {
-                            // Using same random direction logic as locals for ocean avoidance
-                            bool found_valid_move <- false;
-                            int safety_counter <- 0;
-                            int max_safety <- 100; // Safety measure to prevent CPU hogging
-                            
-                            loop while: (not found_valid_move) {
-                                // Try a random direction like locals do
-                                float random_angle <- rnd(360.0);
-                                point possible_move <- self.location + {cos(random_angle) * speed, sin(random_angle) * speed};
-                                
-                                // Check specifically for land, not using is_valid_location
-                                if ((cell_grid closest_to possible_move).is_land) {
-                                    location <- possible_move;
-                                    found_valid_move <- true;
-                                }
-                                
-                                // Safety exit - prevents infinite loops but allows agent to try again next cycle
-                                safety_counter <- safety_counter + 1;
-                                if (safety_counter >= max_safety) {
-                                    break; // Exit this loop but the agent will try again next cycle
-                                }
-                            }
+                            // Fallback: direct movement if no path found
+                            do goto target: target speed: speed;
                         }
-                    } else {
-                        // Same random direction logic for when no path exists
-                        bool found_valid_move <- false;
-                        int safety_counter <- 0;
-                        int max_safety <- 100; // Safety measure to prevent CPU hogging
                         
-                        loop while: (not found_valid_move) {
-                            float random_angle <- rnd(360.0);
-                            point possible_move <- self.location + {cos(random_angle) * speed * 1.2, sin(random_angle) * speed * 1.2};
+                        // Keep normal speed when guiding tourists (no speed boost needed for safety)
+                        // Speed remains as randomized: gauss(speed, 1.0) like NetLogo
+                        
+                    } else {
+                        // STRATEGY 2: Wandering search pattern for tourists
+                        // SPEED BOOST: Increase speed by 20% when searching (matches NetLogo: 1.2 * speed)
+                        float wandering_speed <- gauss(speed * 1.2, 1.0);
+                        
+                        // Ensure speed stays within defined limits
+                        if (wandering_speed < human_speed_min) { wandering_speed <- human_speed_min; }
+                        if (wandering_speed > human_speed_max) { wandering_speed <- human_speed_max; }
+                        
+                        // 8-direction search pattern (matches NetLogo's 45° increments)
+                        float angle_look <- 0.0;
+                        bool found_valid_move <- false;
+                        point target_location <- location;
+                        
+                        // Search in 8 directions (0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°)
+                        loop while: (angle_look < 360 and !found_valid_move) {
+                            float target_x <- location.x + cos(angle_look) * wandering_speed;
+                            float target_y <- location.y + sin(angle_look) * wandering_speed;
+                            point potential_target <- {target_x, target_y};
                             
-                            if ((cell_grid closest_to possible_move).is_land) {
-                                location <- possible_move;
+                            // Check if target location is valid (on land/road and not flooded)
+                            cell_grid target_cell <- cell_grid closest_to potential_target;
+                            if (target_cell != nil and target_cell.is_land and !target_cell.is_flooded) {
+                                target_location <- potential_target;
                                 found_valid_move <- true;
                             }
                             
-                            // Safety exit - prevents infinite loops but allows agent to try again next cycle
-                            safety_counter <- safety_counter + 1;
-                            if (safety_counter >= max_safety) {
-                                break; // Exit this loop but the agent will try again next cycle
+                            angle_look <- angle_look + 45.0; // 45° increments like NetLogo
+                        }
+                        
+                        // Move to the found location with boosted wandering speed
+                        if (found_valid_move) {
+                            location <- target_location;
+                        } else {
+                            // Fallback: random movement if no valid direction found in 8-direction search
+                            float random_angle <- rnd(360.0);
+                            float move_distance <- wandering_speed * 0.5; // Reduce distance for safety
+                            point fallback_target <- location + {cos(random_angle) * move_distance, sin(random_angle) * move_distance};
+                            
+                            cell_grid fallback_cell <- cell_grid closest_to fallback_target;
+                            if (fallback_cell != nil and fallback_cell.is_land) {
+                                location <- fallback_target;
                             }
-                        }
-                    }
-                } else {
-                    // Random wandering when no tourists
-                    bool found_valid_move <- false;
-                    int safety_counter <- 0;
-                    int max_safety <- 100; // Safety measure to prevent CPU hogging
-                    
-                    loop while: (not found_valid_move) {
-                        float random_angle <- rnd(360.0);
-                        point possible_move <- self.location + {cos(random_angle) * speed * 1.2, sin(random_angle) * speed * 1.2};
-                        
-                        if ((cell_grid closest_to possible_move).is_land) {
-                            location <- possible_move;
-                            found_valid_move <- true;
-                        }
-                        
-                        // Safety exit - prevents infinite loops but allows agent to try again next cycle
-                        safety_counter <- safety_counter + 1;
-                        if (safety_counter >= max_safety) {
-                            break; // Exit this loop but the agent will try again next cycle
                         }
                     }
                 }
@@ -777,6 +1058,9 @@ experiment tsunami_simulation type: gui {
     parameter "Number of rescuers" var: rescuers_number min: 0 max: 1000;
     parameter "Tourist Movement Strategy" var: tourist_strategy among: ["wandering", "following rescuers or locals", "following crowd"] init: "following rescuers or locals";
     parameter "Car Movement Strategy" var: car_strategy among:["always go ahead", "go out when congestion"];
+    parameter "Tsunami segments" var: tsunami_nb_segments min: 1 max: 50;
+    parameter "Tsunami approach time" var: tsunami_approach_time min: 0 max: 1000;
+    parameter "Average tsunami speed" var: tsunami_speed_avg min: 10.0 max: 100.0;
     
     output {
         display main_display type: opengl {
@@ -802,6 +1086,71 @@ experiment tsunami_simulation type: gui {
                 }
             }
             
+            // Draw tsunami segments visualization
+            graphics "tsunami_segments" {
+                if (cycle >= tsunami_approach_time) {
+                    float uniform_opacity <- 0.8; // Higher consistent opacity
+                    
+                    loop i from: 0 to: tsunami_nb_segments - 1 {
+                        // Calculate segment boundaries
+                        geometry world_envelope <- envelope(world.shape);
+                        float world_min_y <- world_envelope.location.y - world_envelope.height/2;
+                        float world_max_y <- world_envelope.location.y + world_envelope.height/2;
+                        float segment_y_min <- world_min_y + (tsunami_length_segment * i);
+                        float segment_y_max <- world_min_y + (tsunami_length_segment * (i + 1));
+                        
+                        // Ensure segments have appropriate height
+                        segment_y_min <- max([world_min_y, segment_y_min]);
+                        segment_y_max <- min([world_max_y, segment_y_max]);
+                        float actual_segment_height <- segment_y_max - segment_y_min;
+                        
+                        // Force minimum segment height for edge segments
+                        if (actual_segment_height < tsunami_length_segment * 0.5) {
+                            if (i = 0) {
+                                segment_y_min <- max([world_min_y, segment_y_max - tsunami_length_segment]);
+                            } else if (i = tsunami_nb_segments - 1) {
+                                segment_y_max <- min([world_max_y, segment_y_min + tsunami_length_segment]);
+                            }
+                            actual_segment_height <- segment_y_max - segment_y_min;
+                        }
+                        
+                        // Only draw if segment is within bounds
+                        if (actual_segment_height > 0 and 
+                            tsunami_curr_coord[i] > world_envelope.location.x - world_envelope.width/2 - wave_width and
+                            tsunami_curr_coord[i] < world_envelope.location.x + world_envelope.width/2 + wave_width) {
+                            
+                            float segment_opacity <- uniform_opacity;
+                            
+                            // Ocean vs Land opacity difference
+                            cell_grid nearest_cell <- cell_grid closest_to {tsunami_curr_coord[i], (segment_y_min + segment_y_max) / 2};
+                            if (nearest_cell != nil and nearest_cell.is_land) {
+                                // Reduce opacity on land
+                                segment_opacity <- uniform_opacity * 0.7;
+                            }
+                            
+                            // Draw main segment
+                            geometry segment_shape <- rectangle(wave_width, actual_segment_height) 
+                                at_location {tsunami_curr_coord[i], (segment_y_min + segment_y_max) / 2};
+                            draw segment_shape color: rgb(0, 0, 255, segment_opacity) border: #transparent;
+                            
+                            // Better blending between segments
+                            if (i > 0) {
+                                // Calculate middle point between current and previous segment
+                                float mid_x <- (tsunami_curr_coord[i] + tsunami_curr_coord[i-1])/2;
+                                
+                                // Create overlap for smoother transition
+                                float overlap_height <- tsunami_length_segment * 0.2; // 20% overlap
+                                geometry overlap_shape <- rectangle(wave_width/2, overlap_height)
+                                    at_location {mid_x, segment_y_min + overlap_height/2};
+                                
+                                // Draw overlap with average opacity
+                                draw overlap_shape color: rgb(0, 0, 255, segment_opacity * 0.8) border: #transparent;
+                            }
+                        }
+                    }
+                }
+            }
+            
             graphics "Legend" {
                 float x <- world.shape.width * 0.8;
                 float y <- world.shape.height * 0.95;
@@ -820,38 +1169,34 @@ experiment tsunami_simulation type: gui {
         
         monitor "Safe locals" value: locals_safe;
         monitor "Dead locals" value: locals_dead;
+        monitor "In danger locals" value: locals_in_danger;
         monitor "Safe tourists" value: tourists_safe;
         monitor "Dead tourists" value: tourists_dead;
+        monitor "In danger tourists" value: tourists_in_danger;
         monitor "Safe rescuers" value: rescuers_safe;
         monitor "Dead rescuers" value: rescuers_dead;
+        monitor "In danger rescuers" value: rescuers_in_danger;
         monitor "Safe cars" value: cars_safe;
         monitor "Dead cars" value: cars_dead;
         monitor "Safe boats" value: boats_safe;
         monitor "Dead boats" value: boats_dead;
-        // Add separate charts for safe and dead agents
-        display "Safe Agents Chart" {
-            chart "Safe Agents Status" type: series {
-                // Safe agents data
-                data "Safe Locals" value: locals_safe color: rgb(255, 191, 0);
-                data "Safe Tourists" value: tourists_safe color: #violet;
-                data "Safe Rescuers" value: rescuers_safe color: #blue;
-            }
-        }
         
-        display "Dead Agents Chart" {
-            chart "Dead Agents Status" type: series {
-                // Dead agents data
-                data "Dead Locals" value: locals_dead color: rgb(255, 191, 0);
-                data "Dead Tourists" value: tourists_dead color: #violet;
-                data "Dead Rescuers" value: rescuers_dead color: #blue;
-            }
-        }
-        
-        // Keep the overall pie chart
+        // Overall status histogram chart with percentages - updates automatically
         display "Overall Safety Status" {
-            chart "Overall Safety vs Casualties" type: pie {
-                data "Total Safe" value: locals_safe + tourists_safe + rescuers_safe color: #green;
-                data "Total Casualties" value: locals_dead + tourists_dead + rescuers_dead color: #red;
+            chart "Population Status Percentages" type: histogram {
+                data "Safe (%)" value: (locals_number + tourists_number + rescuers_number > 0 ? 
+                    ((locals_safe + tourists_safe + rescuers_safe) * 100.0 / (locals_number + tourists_number + rescuers_number)) : 0.0) color: #green;
+                data "Dead (%)" value: (locals_number + tourists_number + rescuers_number > 0 ? 
+                    ((locals_dead + tourists_dead + rescuers_dead) * 100.0 / (locals_number + tourists_number + rescuers_number)) : 0.0) color: #red;
+                data "Danger (%)" value: (locals_number + tourists_number + rescuers_number > 0 ? 
+                    ((locals_in_danger + tourists_in_danger + rescuers_in_danger) * 100.0 / (locals_number + tourists_number + rescuers_number)) : 0.0) color: #orange;
+            }
+        }
+        display "Death Percentage Chart" {
+        chart "Death Percentage by Population" type: histogram {
+                data "Locals Dead (%)" value: (locals_number > 0 ? (locals_dead * 100.0 / locals_number) : 0.0) color: #red;
+                data "Tourists Dead (%)" value: (tourists_number > 0 ? (tourists_dead * 100.0 / tourists_number) : 0.0) color: #violet;
+                data "Rescuers Dead (%)" value: (rescuers_number > 0 ? (rescuers_dead * 100.0 / rescuers_number) : 0.0) color: #blue;
             }
         }
     }
