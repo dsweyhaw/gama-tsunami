@@ -1063,7 +1063,7 @@ experiment tsunami_simulation type: gui {
     parameter "Average tsunami speed" var: tsunami_speed_avg min: 10.0 max: 100.0;
     
     output {
-        display main_display type: opengl {
+        display main_display type: opengl axes: false {
             overlay position: { 5, 5 } size: { 180, 20 } background: #black transparency: 0.5 {
                 draw "Tsunami Evacuation Model" at: { 10, 15 } color: #white font: font("Arial", 16, #bold);
             }
